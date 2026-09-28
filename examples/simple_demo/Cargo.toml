@@ -1,0 +1,14 @@
+[package]
+name = "simple_demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+sixer = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+mockall = { workspace = true }
+tokio = { workspace = true, features = ["macros", "test-util"] }
