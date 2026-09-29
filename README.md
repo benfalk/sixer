@@ -58,19 +58,18 @@ Without ports your hexagonal design won't get far; this is how to define them:
 
 ```rust
 pub mod port {
-    #[::sixer::port]
+    #[::sixer::port(async_send)]
     #[cfg_attr(test, ::mockall::automock)]
     pub trait Messages: Send + Sync {
         #[query]
-        fn get(&self, id: u32)
-        -> impl Future<Output = Result<Option<String>, crate::Error>> + Send;
+        async fn get(&self, id: u32) -> Result<Option<String>, crate::Error>;
 
         #[command]
-        fn put(
+        async fn put(
             &self,
             id: u32,
             message: String,
-        ) -> impl Future<Output = Result<(), crate::Error>> + Send;
+        ) -> Result<(), crate::Error>;
     }
 }
 ```
@@ -83,11 +82,13 @@ demonstrate that more in the [cqrs] section.
 Some things to note:
 
 - ports require `Send` + `Sync` so they are async compatible
+- `#[sixer::port(async_send)]` rewrites each `async fn` into
+  `-> impl Future<Output = ...> + Send`. `#[sixer::port]` leaves the
+  signature alone, for a handwritten `impl Future`. Sync methods stay
+  as written either way, and adapters still implement the async
+  methods with `async fn`.
 - `#[cfg_attr(test, ::mockall::automock)]` is required, testing is
   a first class citizen and the test setup is expecting a `MockMessages`
-- If you want your async methods to work on popular runtimes like `tokio`
-  right now we're stuck defining them like this for traits.  I don't care
-  for `async_trait`; but that is also an option.
 
 ### Wiring Up the Service Runtime
 

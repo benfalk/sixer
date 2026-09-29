@@ -69,20 +69,14 @@ pub mod port {
         fn next_widget_id(&self) -> u32;
     }
 
-    #[::sixer::port]
+    #[::sixer::port(async_send)]
     #[cfg_attr(test, ::mockall::automock)]
     pub trait Database: Send + Sync {
         #[query]
-        fn get(
-            &self,
-            id: u32,
-        ) -> impl Future<Output = Result<Option<crate::entity::Widget>, crate::Error>> + Send;
+        async fn get(&self, id: u32) -> Result<Option<crate::entity::Widget>, crate::Error>;
 
         #[command]
-        fn put(
-            &self,
-            widget: crate::entity::Widget,
-        ) -> impl Future<Output = Result<(), crate::Error>> + Send;
+        async fn put(&self, widget: crate::entity::Widget) -> Result<(), crate::Error>;
     }
 }
 

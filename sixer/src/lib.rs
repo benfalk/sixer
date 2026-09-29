@@ -123,6 +123,12 @@ impl Parse for Port {
 /// `mockall::automock`, so it sees the methods first. Every method needs
 /// `#[query]` or `#[command]`.
 ///
+/// `#[sixer::port(async_send)]` rewrites each `async fn` to
+/// `fn ... -> impl Future<Output = ...> + Send`. `#[sixer::port]` leaves
+/// signatures as written, so a method can spell that future by hand. Sync
+/// methods stay ordinary functions either way. Adapters still implement a
+/// rewritten method with `async fn`.
+///
 /// ```
 /// use sixer::port;
 ///
@@ -176,6 +182,33 @@ impl Parse for Port {
 /// fn write_from_query(db: &impl Database) {
 ///     DatabaseQuery::new(db).put(1);
 /// }
+/// ```
+///
+/// ```
+/// use sixer::port;
+///
+/// #[port(async_send)]
+/// trait Database: Send + Sync {
+///     #[query]
+///     async fn get(&self, id: u32) -> u32;
+///
+///     #[command]
+///     fn put(&self, value: u32);
+/// }
+///
+/// struct Mem;
+///
+/// impl Database for Mem {
+///     async fn get(&self, id: u32) -> u32 {
+///         id
+///     }
+///
+///     fn put(&self, _: u32) {}
+/// }
+///
+/// fn assert_send<T: Send>(_: T) {}
+///
+/// assert_send(DatabaseQuery::new(&Mem).get(1));
 /// ```
 #[proc_macro_attribute]
 pub fn port(attr: TokenStream, item: TokenStream) -> TokenStream {

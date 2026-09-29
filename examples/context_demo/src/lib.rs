@@ -25,19 +25,14 @@ impl Context {
 }
 
 pub mod port {
-    #[::sixer::port]
+    #[::sixer::port(async_send)]
     #[cfg_attr(test, ::mockall::automock)]
     pub trait Messages: Send + Sync {
         #[query]
-        fn get(&self, id: u32)
-        -> impl Future<Output = Result<Option<String>, crate::Error>> + Send;
+        async fn get(&self, id: u32) -> Result<Option<String>, crate::Error>;
 
         #[command]
-        fn put(
-            &self,
-            id: u32,
-            message: String,
-        ) -> impl Future<Output = Result<(), crate::Error>> + Send;
+        async fn put(&self, id: u32, message: String) -> Result<(), crate::Error>;
     }
 }
 

@@ -2,9 +2,11 @@
 
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
+use syn::parse::Parser;
+use syn::parse_quote;
 use syn::{
-    Attribute, Error, FnArg, Ident, ItemTrait, Meta, Pat, ReceiverKind, Result, Safety, Signature,
-    TraitItem, TraitItemFn,
+    Attribute, Error, FnArg, Ident, ItemTrait, Meta, Pat, ReceiverKind, Result, ReturnType, Safety,
+    Signature, Token, TraitItem, TraitItemFn, Type,
 };
 
 enum Side {
@@ -13,12 +15,7 @@ enum Side {
 }
 
 pub fn expand(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
-    if !attr.is_empty() {
-        return Err(Error::new_spanned(
-            attr,
-            "#[sixer::port] takes no arguments",
-        ));
-    }
+    let async_send = async_send_arg(attr)?;
 
     let mut trait_item: ItemTrait = syn::parse2(item)?;
     if let Some(unsafety) = &trait_item.unsafety {
@@ -37,7 +34,7 @@ pub fn expand(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
     let mut errors: Option<Error> = None;
     for item in &mut trait_item.items {
         match item {
-            TraitItem::Fn(method) => match prepare(method) {
+            TraitItem::Fn(method) => match prepare(method, async_send) {
                 Ok(Side::Query) => queries.push(method.clone()),
                 Ok(Side::Command) => commands.push(method.clone()),
                 Err(err) => push_error(&mut errors, err),
@@ -93,12 +90,62 @@ pub fn expand(attr: TokenStream2, item: TokenStream2) -> Result<TokenStream2> {
     })
 }
 
-fn prepare(method: &mut TraitItemFn) -> Result<Side> {
+fn prepare(method: &mut TraitItemFn, async_send: bool) -> Result<Side> {
     let side = take_marker(method)?;
     method.modifiers.require_empty()?;
     check_signature(&method.sig)?;
     let _ = arg_idents(&method.sig)?;
+    if async_send {
+        desugar_async_send(method)?;
+    }
     Ok(side)
+}
+
+fn async_send_arg(attr: TokenStream2) -> Result<bool> {
+    let mut found = false;
+    syn::meta::parser(|meta| {
+        if !meta.path.is_ident("async_send") {
+            return Err(meta.error("#[sixer::port] accepts async_send"));
+        }
+        if found {
+            return Err(meta.error("#[sixer::port(async_send)] is written once"));
+        }
+        if meta.input.peek(Token![=]) || meta.input.peek(syn::token::Paren) {
+            return Err(meta.error("#[sixer::port(async_send)] takes no value"));
+        }
+        found = true;
+        Ok(())
+    })
+    .parse2(attr)?;
+    Ok(found)
+}
+
+fn desugar_async_send(method: &mut TraitItemFn) -> Result<()> {
+    if method.sig.asyncness.is_none() {
+        return Ok(());
+    }
+    if let ReturnType::Type(_, ty) = &method.sig.output
+        && matches!(ty.as_ref(), Type::ImplTrait(_))
+    {
+        return Err(Error::new_spanned(
+            &method.sig.output,
+            "#[sixer::port(async_send)] rewrites async fn; this return is already impl Trait",
+        ));
+    }
+
+    method.sig.asyncness = None;
+    let output = match &method.sig.output {
+        ReturnType::Default => quote! { () },
+        ReturnType::Type(_, ty) => quote! { #ty },
+    };
+    method.sig.output = parse_quote! {
+        -> impl ::core::future::Future<Output = #output> + ::core::marker::Send
+    };
+    if let Some(body) = method.default.take() {
+        // The `async fn` body is the body of the future it returns.
+        method.default = Some(parse_quote!({ async move #body }));
+    }
+    Ok(())
 }
 
 fn take_marker(method: &mut TraitItemFn) -> Result<Side> {
@@ -372,5 +419,242 @@ mod tests {
         let Items(items) = syn::parse2(output).unwrap();
         assert_eq!(view_methods(&items, "ClockQuery"), ["new"]);
         assert_eq!(view_methods(&items, "ClockCommand"), ["new"]);
+    }
+
+    fn trait_fn<'a>(items: &'a [Item], trait_name: &str, method: &str) -> &'a TraitItemFn {
+        let Some(Item::Trait(trait_item)) = items
+            .iter()
+            .find(|item| matches!(item, Item::Trait(trait_item) if trait_item.ident == trait_name))
+        else {
+            panic!("missing trait {trait_name}");
+        };
+        trait_item
+            .items
+            .iter()
+            .find_map(|item| match item {
+                TraitItem::Fn(method_item) if method_item.sig.ident == method => Some(method_item),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing {trait_name}::{method}"))
+    }
+
+    fn view_fn<'a>(items: &'a [Item], view: &str, method: &str) -> &'a syn::ImplItemFn {
+        let Some(Item::Impl(impl_item)) = items.iter().find(|item| match item {
+            Item::Impl(impl_item) => {
+                impl_item.trait_.is_none()
+                    && matches!(
+                        &*impl_item.self_ty,
+                        syn::Type::Path(path)
+                            if path.path.segments.last().is_some_and(|segment| segment.ident == view)
+                    )
+            }
+            _ => false,
+        }) else {
+            panic!("missing impl {view}");
+        };
+        impl_item
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::ImplItem::Fn(method_item) if method_item.sig.ident == method => {
+                    Some(method_item)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing {view}::{method}"))
+    }
+
+    fn renders_send_future(sig: &Signature, output: &str) {
+        assert!(sig.asyncness.is_none());
+        let text = quote!(#sig).to_string();
+        assert!(text.contains(":: core :: future :: Future"), "{text}");
+        assert!(text.contains(":: core :: marker :: Send"), "{text}");
+        assert!(text.contains(output), "{text}");
+    }
+
+    #[test]
+    fn async_send_rewrites_async_fns_and_leaves_sync_fns() {
+        let output = expand(
+            quote!(async_send),
+            quote! {
+                #[doc = "port"]
+                pub trait Mailbox: Send + Sync {
+                    #[query]
+                    async fn get(&self, id: u32) -> Option<u32>;
+
+                    #[command]
+                    fn stamp(&self) -> u32;
+
+                    #[command]
+                    async fn ping(&self);
+
+                    #[query]
+                    fn names(&self) -> impl Iterator<Item = u32>;
+
+                    /// keep
+                    #[query]
+                    async fn echo<T>(&self, value: T) -> T {
+                        value
+                    }
+                }
+            },
+        )
+        .unwrap();
+        let Items(items) = syn::parse2(output).unwrap();
+
+        let Item::Trait(mailbox) = items
+            .iter()
+            .find(|item| matches!(item, Item::Trait(trait_item) if trait_item.ident == "Mailbox"))
+            .unwrap()
+        else {
+            unreachable!();
+        };
+        assert!(mailbox.attrs.iter().any(|attr| attr.path().is_ident("doc")));
+
+        let get = trait_fn(&items, "Mailbox", "get");
+        renders_send_future(&get.sig, "Option < u32 >");
+        assert!(get.default.is_none());
+
+        let stamp = trait_fn(&items, "Mailbox", "stamp");
+        assert!(stamp.sig.asyncness.is_none());
+        let stamp_output = &stamp.sig.output;
+        let stamp_text = quote!(#stamp_output).to_string();
+        assert!(stamp_text.contains("u32"), "{stamp_text}");
+        assert!(!stamp_text.contains("Future"), "{stamp_text}");
+
+        let ping = trait_fn(&items, "Mailbox", "ping");
+        renders_send_future(&ping.sig, "()");
+
+        let names = trait_fn(&items, "Mailbox", "names");
+        let names_output = &names.sig.output;
+        let names_text = quote!(#names_output).to_string();
+        assert!(names_text.contains("Iterator"), "{names_text}");
+        assert!(!names_text.contains("Future"), "{names_text}");
+
+        let echo = trait_fn(&items, "Mailbox", "echo");
+        renders_send_future(&echo.sig, "T");
+        assert!(echo.attrs.iter().any(|attr| attr.path().is_ident("doc")));
+        let body = echo.default.as_ref().expect("default body");
+        let body_text = quote!(#body).to_string();
+        assert!(body_text.contains("async move"), "{body_text}");
+        assert!(body_text.contains("value"), "{body_text}");
+
+        let view_get = view_fn(&items, "MailboxQuery", "get");
+        renders_send_future(&view_get.sig, "Option < u32 >");
+        let view_body = &view_get.block;
+        let view_body_text = quote!(#view_body).to_string();
+        assert!(!view_body_text.contains("await"), "{view_body_text}");
+
+        let view_stamp = view_fn(&items, "MailboxCommand", "stamp");
+        assert!(view_stamp.sig.asyncness.is_none());
+        let view_stamp_output = &view_stamp.sig.output;
+        let view_stamp_text = quote!(#view_stamp_output).to_string();
+        assert!(!view_stamp_text.contains("Future"), "{view_stamp_text}");
+    }
+
+    #[test]
+    fn bare_port_keeps_a_handwritten_future() {
+        let output = expand(
+            TokenStream2::new(),
+            quote! {
+                trait Database: Send + Sync {
+                    #[query]
+                    fn get(&self) -> impl Future<Output = u32> + Send;
+                }
+            },
+        )
+        .unwrap();
+        let Items(items) = syn::parse2(output).unwrap();
+        let get = trait_fn(&items, "Database", "get");
+        assert!(get.sig.asyncness.is_none());
+        let sig = &get.sig;
+        let text = quote!(#sig).to_string();
+        assert!(
+            text.contains("impl Future < Output = u32 > + Send"),
+            "{text}"
+        );
+        assert!(!text.contains("core :: future"), "{text}");
+    }
+
+    #[test]
+    fn async_fn_without_async_send_stays_async() {
+        let output = expand(
+            TokenStream2::new(),
+            quote! {
+                trait Database: Send + Sync {
+                    #[query]
+                    async fn get(&self) -> u32;
+                }
+            },
+        )
+        .unwrap();
+        let Items(items) = syn::parse2(output).unwrap();
+        assert!(trait_fn(&items, "Database", "get").sig.asyncness.is_some());
+        assert!(
+            view_fn(&items, "DatabaseQuery", "get")
+                .sig
+                .asyncness
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn port_accepts_only_async_send() {
+        let err = expand(
+            quote!(send),
+            quote! {
+                trait Database {
+                    #[query]
+                    fn get(&self) -> u32;
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("accepts async_send"));
+    }
+
+    #[test]
+    fn async_send_is_written_once() {
+        let err = expand(
+            quote!(async_send, async_send),
+            quote! {
+                trait Database {
+                    #[query]
+                    fn get(&self) -> u32;
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("written once"));
+    }
+
+    #[test]
+    fn async_send_takes_no_value() {
+        let err = expand(
+            quote!(async_send = true),
+            quote! {
+                trait Database {
+                    #[query]
+                    fn get(&self) -> u32;
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("takes no value"));
+    }
+
+    #[test]
+    fn async_send_rejects_an_impl_trait_return() {
+        let err = expand(
+            quote!(async_send),
+            quote! {
+                trait Database {
+                    #[query]
+                    async fn get(&self) -> impl Iterator<Item = u32>;
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already impl Trait"));
     }
 }

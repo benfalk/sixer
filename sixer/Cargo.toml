@@ -1,6 +1,6 @@
 [package]
 name = "sixer"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 authors = ["Ben Falk <benjamin.falk@yahoo.com>"]
 description = "Hexagonal proc-macro runtime design helper"
