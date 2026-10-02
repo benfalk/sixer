@@ -159,6 +159,159 @@ impl StoreMyMessage {
 }
 ```
 
+### Starting a Workflow
+
+`workflow` on `runtime!` opts the service into durable runs. The
+application crate depends on durare 0.4 and on serde with `derive`.
+Durare 0.4 needs a `postgres` or `sqlite` feature. `postgres` skips the
+SQLite C build, and `InMemoryProvider` is still a valid state backend.
+
+```toml
+durare = { version = "0.4", default-features = false, features = ["postgres"] }
+serde = { version = "1", features = ["derive"] }
+```
+
+`Error` implements `From<durare::Error>` and `Display`. The context
+implements `Clone`, `Serialize`, and `Deserialize`.
+
+`workflows` lists the types `launch` registers. Leave the list empty
+until a workflow exists, then add its path. Paths are full paths, the
+same way port paths are. `launch` takes no type arguments.
+
+```rust
+::sixer::runtime! {
+    error = crate::Error,
+    context = crate::Context,
+    workflow,
+    ports {
+        database: DB: crate::port::Database,
+    },
+    workflows {
+        crate::cqrs::Copy,
+    },
+}
+```
+
+A command starts a run and returns a `WorkflowRun`. It does not wait.
+Pass the idempotency id to `start_workflow`. The workflow value is the
+input. A query env has no `start_workflow`. A running workflow cannot
+start another one.
+
+```rust
+#[::sixer::command]
+impl Copy {
+    async fn run(
+        self,
+        env: &impl CommandEnv,
+    ) -> Result<WorkflowRun<()>, Error> {
+        let id = format!(
+            "{}:{}:{}",
+            Self::name(),
+            self.key,
+            self.dest,
+        );
+        env.start_workflow(&id, self).await
+    }
+}
+
+#[::sixer::workflow("copy")]
+impl Copy {
+    async fn run(
+        self,
+        ctx: &WorkflowContext,
+        env: &impl CommandEnv,
+    ) -> Result<(), Error> {
+        let key = self.key;
+        let value = ctx
+            .step("read", env.database().get(key))
+            .await?;
+        Put { key: self.dest, val: value }.run(env).await
+    }
+}
+```
+
+`#[::sixer::workflow("copy")]` sets the registration name. A handwritten
+`fn name() -> &'static str` does the same job. Without either, the
+default calls `std::any::type_name`, and that string can change
+between compilers, so a persisted run sets a fixed name. `ctx.step`
+journals the first outcome of a port call. A call left outside
+`step` runs live, so a privilege check still applies.
+
+`ctx.attempt` retries before that write. It takes the step name and
+returns a builder. `max_retries` counts attempts after the first
+failure. `run` takes a closure the builder can call again. Only the
+final success or the final error is saved. With no `retry_if`
+predicate, every error is retried. A predicate sees the crate error
+built from the failure's message. The builder also takes
+`backoff_factor`, `base_interval`, and `max_interval`.
+
+```rust
+let value = ctx
+    .attempt("read")
+    .max_retries(3)
+    .base_interval(std::time::Duration::from_millis(50))
+    .run(|| env.database().get(key))
+    .await?;
+```
+
+`#[::sixer::attempt_defaults]` sets that policy for every
+`ctx.attempt` in the workflow. A duration is a whole number of
+`ns`, `us`, `ms`, or `s`, written `50ms` or `"50ms"`, or any
+`Duration` expression. The trait default is one try, a backoff
+factor of `2.0`, a `100ms` base delay, and a `5s` cap. One call can
+still change its own attempt. A handwritten `fn attempt_defaults`
+does the same job.
+
+```rust
+#[::sixer::workflow("copy")]
+#[::sixer::attempt_defaults(
+    max_retries = 3,
+    backoff_factor = 2.0,
+    base_interval = 50ms,
+    max_interval = 5s,
+)]
+impl Copy {
+    async fn run(
+        self,
+        ctx: &WorkflowContext,
+        env: &impl CommandEnv,
+    ) -> Result<u32, Error> {
+        let key = self.key;
+        ctx.attempt("read")
+            .run(|| env.database().get(key))
+            .await
+    }
+}
+```
+
+```rust
+let service = Service::builder()
+    .database(db)
+    .workflow_provider(std::sync::Arc::new(
+        durare::InMemoryProvider::new(),
+    ))
+    .build();
+service.launch().await?;
+```
+
+`Service::new` takes that provider after the ports. A test sets
+`MockEnv::expect_start_workflow` and returns `WorkflowRun::ready`.
+
+`run_workflow` runs one workflow against a mock env and returns the
+outcome. `step` and `attempt` call those ports. Retries follow the
+workflow's attempt policy and happen immediately. Nothing is
+journaled.
+
+```rust
+let mut env = MockEnv::default();
+let value = run_workflow(&env, FlakyRead { key: 7 }).await?;
+```
+
+`shutdown` waits up to the timeout for background tasks. The workflow
+body does not watch that deadline. A run still awaiting when the wait
+ends keeps going. The engine and the ports stay until the last
+`Service` clone drops. Shutdown before launch returns `Ok`.
+
 ### Creating Tests
 
 Here is some examples of tests for our new query and command:

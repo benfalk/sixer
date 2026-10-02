@@ -73,6 +73,56 @@ fn assert_send<T: Send>(value: T) -> T {
     value
 }
 
+#[sixer::port(async_send)]
+trait Lookup: Send + Sync {
+    #[query]
+    async fn echo<T: Send>(&self, value: T) -> T;
+
+    #[query]
+    async fn find(&self, name: &str) -> usize;
+
+    #[query]
+    async fn both(&self, name: &str, n: &u32) -> usize;
+
+    #[query]
+    async fn label(&self) -> &str;
+
+    #[query]
+    async fn nth<const N: usize>(&self) -> u32;
+}
+
+#[derive(Clone, Copy)]
+struct Words;
+
+impl Lookup for Words {
+    async fn echo<T: Send>(&self, value: T) -> T {
+        value
+    }
+
+    async fn find(&self, name: &str) -> usize {
+        name.len()
+    }
+
+    async fn both(&self, name: &str, n: &u32) -> usize {
+        name.len() + *n as usize
+    }
+
+    async fn label(&self) -> &str {
+        "ok"
+    }
+
+    async fn nth<const N: usize>(&self) -> u32 {
+        N as u32
+    }
+}
+
+fn retry<F, Fut>(mut call: F) -> Fut
+where
+    F: FnMut() -> Fut,
+{
+    call()
+}
+
 #[test]
 fn rewritten_method_is_send_and_runs() {
     let memory = Memory;
@@ -91,6 +141,18 @@ fn mock_returns_a_boxed_future() {
 
     let found = ready(Read(4).run(&env)).expect("read");
     assert_eq!(found, Some(5));
+}
+
+#[test]
+fn a_closure_returns_the_port_future() {
+    let words = Words;
+    let name = "port";
+    let n = 3u32;
+    assert_eq!(ready(retry(|| LookupQuery::new(&words).echo(1u8))), 1);
+    assert_eq!(ready(retry(|| LookupQuery::new(&words).find(name))), 4);
+    assert_eq!(ready(retry(|| LookupQuery::new(&words).both(name, &n))), 7);
+    assert_eq!(ready(retry(|| LookupQuery::new(&words).label())), "ok");
+    assert_eq!(ready(retry(|| LookupQuery::new(&words).nth::<4>())), 4);
 }
 
 #[test]

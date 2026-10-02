@@ -1,6 +1,6 @@
 [package]
 name = "sixer"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["Ben Falk <benjamin.falk@yahoo.com>"]
 description = "Hexagonal proc-macro runtime design helper"
@@ -15,7 +15,7 @@ proc-macro = true
 [dependencies]
 proc-macro2 = "1"
 quote = "1"
-syn = { version = "3", features = ["full", "parsing"] }
+syn = { version = "3", features = ["full", "parsing", "visit-mut"] }
 
 [dev-dependencies]
 mockall = "0.15"

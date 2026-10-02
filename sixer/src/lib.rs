@@ -9,8 +9,11 @@
 //! accessors return the query view. `CommandEnv` accessors return the command
 //! view, which includes the query methods.
 //!
-//! [`query`] and [`command`] sit on an inherent impl whose `async fn run`
-//! returns `Result<Output, Error>`. They emit the sealed trait impl.
+//! [`query`], [`command`], and [`workflow`] sit on an inherent impl whose
+//! `async fn run` returns `Result<Output, Error>`. They emit the sealed trait
+//! impl. [`workflow`] is generated only when `runtime!` opts in. Pass a name,
+//! `#[workflow("copy")]`, to override `fn name`. [`attempt_defaults`] on that
+//! impl fills in `fn attempt_defaults`.
 //!
 //! `cargo test` of the calling crate needs `mockall` as a dev-dependency.
 //! Production builds do not.
@@ -23,16 +26,21 @@ use syn::{Ident, Path, PathArguments, Result, Token, Type, braced};
 
 mod port_view;
 mod use_case;
+mod workflow_gen;
 
 mod kw {
     syn::custom_keyword!(error);
     syn::custom_keyword!(context);
+    syn::custom_keyword!(workflow);
+    syn::custom_keyword!(workflows);
     syn::custom_keyword!(ports);
 }
 
 struct RuntimeInput {
     error: Type,
     context: Option<Type>,
+    workflow: bool,
+    workflows: Vec<Path>,
     ports: Vec<Port>,
 }
 
@@ -62,6 +70,17 @@ impl Parse for RuntimeInput {
             None
         };
 
+        let workflow = if input.peek(kw::workflow) {
+            if context.is_none() {
+                return Err(input.error("workflow requires context"));
+            }
+            input.parse::<kw::workflow>()?;
+            let _ = input.parse::<Option<Token![,]>>()?;
+            true
+        } else {
+            false
+        };
+
         input.parse::<kw::ports>()?;
         let body;
         braced!(body in input);
@@ -77,9 +96,33 @@ impl Parse for RuntimeInput {
             return Err(body.error("runtime! needs at least one port"));
         }
         let _ = input.parse::<Option<Token![,]>>()?;
+
+        let workflows = if input.peek(kw::workflows) {
+            if !workflow {
+                return Err(input.error("workflows requires workflow"));
+            }
+            input.parse::<kw::workflows>()?;
+            let list;
+            braced!(list in input);
+            let mut workflows = Vec::new();
+            while !list.is_empty() {
+                workflows.push(list.parse()?);
+                if list.is_empty() {
+                    break;
+                }
+                list.parse::<Token![,]>()?;
+            }
+            let _ = input.parse::<Option<Token![,]>>()?;
+            workflows
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             error,
             context,
+            workflow,
+            workflows,
             ports,
         })
     }
@@ -271,6 +314,40 @@ pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+/// Lifts `async fn run` from an inherent impl onto `Workflow`.
+///
+/// `run` takes `self`, `&WorkflowContext`, and `&impl CommandEnv`. `Output`
+/// and `Error` are the two type arguments of the function's `Result`. An
+/// optional name, `#[workflow("copy")]`, or `fn name() -> &'static str`,
+/// overrides the registration name. Optional
+/// `fn attempt_defaults() -> AttemptDefaults`, or [`attempt_defaults`], sets
+/// the policy for every `ctx.attempt`. Other methods in the impl stay
+/// inherent. `runtime!` must opt in with `workflow` or the `Workflow` trait
+/// is not generated.
+#[proc_macro_attribute]
+pub fn workflow(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match use_case::expand(attr.into(), item.into(), use_case::Kind::Workflow) {
+        Ok(expanded) => expanded.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Sets the retry policy for every `ctx.attempt` in a workflow.
+///
+/// Place it on the same inherent impl as [`workflow`]. The macro emits
+/// `fn attempt_defaults() -> AttemptDefaults`. Options are `max_retries`,
+/// `backoff_factor`, `base_interval`, and `max_interval`. A duration is a
+/// whole number of `ns`, `us`, `ms`, or `s` (`50ms` or `"50ms"`), or any
+/// `Duration` expression. Omitted options keep the trait default. A
+/// handwritten `fn attempt_defaults` does the same job.
+#[proc_macro_attribute]
+pub fn attempt_defaults(attr: TokenStream, item: TokenStream) -> TokenStream {
+    match use_case::apply_attempt_defaults(attr.into(), item.into()) {
+        Ok(expanded) => expanded.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
 /// `path::Database` becomes `path::DatabaseQuery` or `path::DatabaseCommand`.
 fn view_for_bound(bound: &Path, suffix: &str) -> Result<Path> {
     let mut view = bound.clone();
@@ -332,6 +409,36 @@ fn mock_for_bound(bound: &Path) -> Result<Path> {
 /// that call, and nested queries and commands see the same borrow. A use case
 /// reads it with `env.ctx()`. Without `context`, those methods are not
 /// generated and `Env` implements the environment traits directly.
+///
+/// `workflow` comes after `context` and requires it. `workflows { Type, ... }`
+/// comes after `ports` and lists the types `Service::launch` registers. An
+/// omitted list is empty. The application crate depends on `durare` and
+/// `serde`. This crate does not.
+///
+/// Without `workflow`, a command env has no `start_workflow`.
+///
+/// ```compile_fail,E0599
+/// use sixer::port;
+///
+/// #[port]
+/// trait Store: Send + Sync {
+///     #[command]
+///     fn put(&self, value: u32);
+/// }
+///
+/// sixer::runtime! {
+///     error = (),
+///     ports {
+///         store: Store: crate::Store,
+///     }
+/// }
+///
+/// fn start(env: &impl service::CommandEnv) {
+///     let _ = env.start_workflow("id", ());
+/// }
+///
+/// fn main() {}
+/// ```
 #[proc_macro]
 pub fn runtime(input: TokenStream) -> TokenStream {
     match syn::parse(input) {
@@ -460,7 +567,7 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
         .ports
         .iter()
         .enumerate()
-        .map(|(index, port)| setter_impl(&input.ports, index, port))
+        .map(|(index, port)| setter_impl(&input.ports, index, port, input.workflow))
         .collect();
     let context_query_bodies: Vec<_> = input
         .ports
@@ -478,7 +585,7 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
             fn ctx(&self) -> &#ty;
         }
     });
-    let service_calls = service_calls(input.context.as_ref());
+    let service_calls = service_calls(input.context.as_ref(), input.workflow);
     let direct_env_impls = if input.context.is_none() {
         quote! {
             impl<P: Ports> EnvExt for Env<P> {
@@ -528,6 +635,7 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
         input.context.as_ref(),
         &context_query_bodies,
         &context_command_bodies,
+        input.workflow,
     );
     let mock_ctx_field = input.context.as_ref().map(|ty| quote! { pub ctx: #ty, });
     let mock_ctx_body = input.context.as_ref().map(|ty| {
@@ -537,7 +645,198 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
             }
         }
     });
-    let reexport = if input.context.is_some() {
+    let service_struct = if input.workflow {
+        quote! {
+            struct Shared<P: Ports> {
+                env: ::std::sync::Arc<Env<P>>,
+                provider: ::std::sync::Arc<dyn ::durare::StateProvider>,
+                engine: ::std::sync::OnceLock<::durare::DurableEngine>,
+            }
+
+            pub struct Service<P: Ports> {
+                shared: ::std::sync::Arc<Shared<P>>,
+            }
+        }
+    } else {
+        quote! {
+            pub struct Service<P: Ports> {
+                env: ::std::sync::Arc<Env<P>>,
+            }
+        }
+    };
+    let service_new = if input.workflow {
+        quote! {
+            pub fn new(
+                #(#new_params,)*
+                provider: ::std::sync::Arc<dyn ::durare::StateProvider>,
+            ) -> Self {
+                Self {
+                    shared: ::std::sync::Arc::new(Shared {
+                        env: ::std::sync::Arc::new(Env { #(#env_init,)* }),
+                        provider,
+                        engine: ::std::sync::OnceLock::new(),
+                    }),
+                }
+            }
+        }
+    } else {
+        quote! {
+            pub fn new(#(#new_params),*) -> Self {
+                Self {
+                    env: ::std::sync::Arc::new(Env { #(#env_init,)* }),
+                }
+            }
+        }
+    };
+    let builder_struct = if input.workflow {
+        quote! {
+            pub struct ServiceBuilder<P, #(#builder_params),*, Provider = Unset> {
+                #(#builder_fields,)*
+                provider: Provider,
+                _ports: ::core::marker::PhantomData<fn() -> P>,
+            }
+        }
+    } else {
+        quote! {
+            pub struct ServiceBuilder<P, #(#builder_params),*> {
+                #(#builder_fields,)*
+                _ports: ::core::marker::PhantomData<fn() -> P>,
+            }
+        }
+    };
+    let builder_fn = if input.workflow {
+        quote! {
+            /// Name each port, in any order, and set the workflow provider.
+            /// `build` is only implemented once every port and the provider
+            /// are set.
+            #[must_use]
+            pub fn builder() -> ServiceBuilder<P> {
+                ServiceBuilder {
+                    #(#builder_unset,)*
+                    provider: Unset,
+                    _ports: ::core::marker::PhantomData,
+                }
+            }
+        }
+    } else {
+        quote! {
+            /// Name each port, in any order. `build` is only implemented
+            /// once every port has been set.
+            #[must_use]
+            pub fn builder() -> ServiceBuilder<P> {
+                ServiceBuilder {
+                    #(#builder_unset,)*
+                    _ports: ::core::marker::PhantomData,
+                }
+            }
+        }
+    };
+    let clone_impl = if input.workflow {
+        quote! {
+            impl<P: Ports> Clone for Service<P> {
+                fn clone(&self) -> Self {
+                    Self {
+                        shared: ::std::sync::Arc::clone(&self.shared),
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl<P: Ports> Clone for Service<P> {
+                fn clone(&self) -> Self {
+                    Self {
+                        env: ::std::sync::Arc::clone(&self.env),
+                    }
+                }
+            }
+        }
+    };
+    let build_impl = if input.workflow {
+        quote! {
+            impl<P: Ports> ServiceBuilder<
+                P,
+                #(#ready_params),*,
+                ::std::sync::Arc<dyn ::durare::StateProvider>,
+            > {
+                pub fn build(self) -> Service<P> {
+                    Service {
+                        shared: ::std::sync::Arc::new(Shared {
+                            env: ::std::sync::Arc::new(Env {
+                                #(#ready_moves,)*
+                            }),
+                            provider: self.provider,
+                            engine: ::std::sync::OnceLock::new(),
+                        }),
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {
+            impl<P: Ports> ServiceBuilder<P, #(#ready_params),*> {
+                pub fn build(self) -> Service<P> {
+                    Service {
+                        env: ::std::sync::Arc::new(Env {
+                            #(#ready_moves,)*
+                        }),
+                    }
+                }
+            }
+        }
+    };
+    let workflow_provider = if input.workflow {
+        workflow_provider_impl(&input.ports)
+    } else {
+        quote! {}
+    };
+    let launch_shutdown = if input.workflow {
+        workflow_gen::service_methods(
+            error,
+            input.context.as_ref().expect("workflow requires context"),
+            &input.workflows,
+        )
+    } else {
+        quote! {}
+    };
+    let command_env_bounds = if input.workflow {
+        quote! { EnvExt + QueryRuntime + CommandRuntime + WorkflowRuntime }
+    } else {
+        quote! { EnvExt + QueryRuntime + CommandRuntime }
+    };
+    let workflow_items = if input.workflow {
+        let context = input.context.as_ref().expect("workflow requires context");
+        let runtime_trait = workflow_gen::runtime_trait(error);
+        let items = workflow_gen::items(
+            error,
+            context,
+            &context_query_bodies,
+            &context_command_bodies,
+        );
+        let start = workflow_gen::context_start(error, context);
+        quote! {
+            #runtime_trait
+            #items
+            #start
+        }
+    } else {
+        quote! {}
+    };
+    let (expect_start_alias, mock_workflow_field, expect_start_method, mock_workflow_impl) =
+        if input.workflow {
+            let (alias, field, expect) = workflow_gen::mock_pieces();
+            (alias, field, expect, workflow_gen::mock_impl(error))
+        } else {
+            (quote! {}, quote! {}, quote! {}, quote! {})
+        };
+    let reexport = if input.workflow {
+        quote! {
+            pub use service::{
+                Attempt, AttemptDefaults, ContextRuntime, Ports, Service, Workflow,
+                WorkflowContext, WorkflowRun,
+            };
+        }
+    } else if input.context.is_some() {
         quote! { pub use service::{ContextRuntime, Ports, Service}; }
     } else {
         quote! { pub use service::{Ports, Service}; }
@@ -549,57 +848,30 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
                 #(#port_types)*
             }
 
-            pub struct Service<P: Ports> {
-                env: ::std::sync::Arc<Env<P>>,
-            }
+            #service_struct
 
             #[doc(hidden)]
             pub struct Unset;
 
-            pub struct ServiceBuilder<P, #(#builder_params),*> {
-                #(#builder_fields,)*
-                _ports: ::core::marker::PhantomData<fn() -> P>,
-            }
+            #builder_struct
 
             impl<P: Ports> Service<P> {
-                pub fn new(#(#new_params),*) -> Self {
-                    Self {
-                        env: ::std::sync::Arc::new(Env { #(#env_init,)* }),
-                    }
-                }
+                #service_new
 
-                /// Name each port, in any order. `build` is only implemented
-                /// once every port has been set.
-                #[must_use]
-                pub fn builder() -> ServiceBuilder<P> {
-                    ServiceBuilder {
-                        #(#builder_unset,)*
-                        _ports: ::core::marker::PhantomData,
-                    }
-                }
+                #builder_fn
 
                 #service_calls
+
+                #launch_shutdown
             }
 
-            impl<P: Ports> Clone for Service<P> {
-                fn clone(&self) -> Self {
-                    Self {
-                        env: ::std::sync::Arc::clone(&self.env),
-                    }
-                }
-            }
+            #clone_impl
 
             #(#setters)*
 
-            impl<P: Ports> ServiceBuilder<P, #(#ready_params),*> {
-                pub fn build(self) -> Service<P> {
-                    Service {
-                        env: ::std::sync::Arc::new(Env {
-                            #(#ready_moves,)*
-                        }),
-                    }
-                }
-            }
+            #workflow_provider
+
+            #build_impl
 
             struct Env<P: Ports> {
                 #(#env_fields,)*
@@ -643,7 +915,7 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
             ///
             /// This does not extend `QueryEnv`. Both traits name the same
             /// accessors, and the views have different types.
-            pub trait CommandEnv: EnvExt + QueryRuntime + CommandRuntime {
+            pub trait CommandEnv: #command_env_bounds {
                 #(#command_accessors;)*
             }
 
@@ -675,6 +947,8 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
 
             #context_runtime
 
+            #workflow_items
+
             #[cfg(test)]
             mod tests_doubles {
                 use super::*;
@@ -683,6 +957,7 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
                     super::__mock_MockQueryRuntime_QueryRuntime::__query::Expectation<Q>;
                 type ExpectCommand<C> =
                     super::__mock_MockCommandRuntime_CommandRuntime::__command::Expectation<C>;
+                #expect_start_alias
 
                 #[derive(Default)]
                 pub struct MockEnv {
@@ -690,6 +965,7 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
                     #mock_ctx_field
                     queries: MockQueryRuntime,
                     commands: MockCommandRuntime,
+                    #mock_workflow_field
                 }
 
                 impl MockEnv {
@@ -707,6 +983,8 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
                     {
                         self.commands.expect_command::<C>()
                     }
+
+                    #expect_start_method
                 }
 
                 impl Ports for MockEnv {
@@ -749,6 +1027,8 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
                 impl CommandEnv for MockEnv {
                     #(#command_bodies)*
                 }
+
+                #mock_workflow_impl
             }
 
             #[cfg(test)]
@@ -759,7 +1039,7 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
     }
 }
 
-fn service_calls(context: Option<&Type>) -> TokenStream2 {
+fn service_calls(context: Option<&Type>, workflow: bool) -> TokenStream2 {
     let Some(ty) = context else {
         return quote! {
             /// Run a command. Nested queries share this environment.
@@ -784,6 +1064,19 @@ fn service_calls(context: Option<&Type>) -> TokenStream2 {
                 query.run(self.env.as_ref()).await
             }
         };
+    };
+
+    let with_context_fields = if workflow {
+        quote! {
+            env: self.shared.env.as_ref(),
+            engine: &self.shared.engine,
+            ctx,
+        }
+    } else {
+        quote! {
+            env: self.env.as_ref(),
+            ctx,
+        }
     };
 
     quote! {
@@ -820,10 +1113,7 @@ fn service_calls(context: Option<&Type>) -> TokenStream2 {
             &'a self,
             ctx: &'a #ty,
         ) -> ContextRuntime<'a, P> {
-            ContextRuntime {
-                env: self.env.as_ref(),
-                ctx,
-            }
+            ContextRuntime { #with_context_fields }
         }
     }
 }
@@ -832,14 +1122,21 @@ fn context_runtime(
     context: Option<&Type>,
     query_bodies: &[TokenStream2],
     command_bodies: &[TokenStream2],
+    workflow: bool,
 ) -> TokenStream2 {
     let Some(ty) = context else {
         return quote! {};
+    };
+    let engine_field = if workflow {
+        quote! { engine: &'a ::std::sync::OnceLock<::durare::DurableEngine>, }
+    } else {
+        quote! {}
     };
 
     quote! {
         pub struct ContextRuntime<'a, P: Ports> {
             env: &'a Env<P>,
+            #engine_field
             ctx: &'a #ty,
         }
 
@@ -914,7 +1211,39 @@ fn context_runtime(
     }
 }
 
-fn setter_impl(ports: &[Port], index: usize, port: &Port) -> TokenStream2 {
+fn workflow_provider_impl(ports: &[Port]) -> TokenStream2 {
+    let generics: Vec<_> = ports.iter().map(|port| &port.assoc).collect();
+    let moves: Vec<_> = ports
+        .iter()
+        .map(|port| {
+            let field = &port.field;
+            quote! { #field: self.#field }
+        })
+        .collect();
+
+    quote! {
+        impl<P: Ports, #(#generics),*> ServiceBuilder<P, #(#generics),*, Unset> {
+            /// State backend for the workflows this service launches.
+            #[must_use]
+            pub fn workflow_provider(
+                self,
+                provider: ::std::sync::Arc<dyn ::durare::StateProvider>,
+            ) -> ServiceBuilder<
+                P,
+                #(#generics),*,
+                ::std::sync::Arc<dyn ::durare::StateProvider>,
+            > {
+                ServiceBuilder {
+                    #(#moves,)*
+                    provider,
+                    _ports: ::core::marker::PhantomData,
+                }
+            }
+        }
+    }
+}
+
+fn setter_impl(ports: &[Port], index: usize, port: &Port, workflow: bool) -> TokenStream2 {
     let field = &port.field;
     let assoc = &port.assoc;
     let other_generics: Vec<_> = ports
@@ -957,16 +1286,35 @@ fn setter_impl(ports: &[Port], index: usize, port: &Port) -> TokenStream2 {
         })
         .collect();
 
+    if !workflow {
+        return quote! {
+            impl<P: Ports, #(#other_generics),*> ServiceBuilder<P, #(#before),*> {
+                #[must_use]
+                pub fn #field(
+                    self,
+                    #field: <P as Ports>::#assoc,
+                ) -> ServiceBuilder<P, #(#after),*> {
+                    ServiceBuilder {
+                        #field,
+                        #(#other_moves,)*
+                        _ports: ::core::marker::PhantomData,
+                    }
+                }
+            }
+        };
+    }
+
     quote! {
-        impl<P: Ports, #(#other_generics),*> ServiceBuilder<P, #(#before),*> {
+        impl<P: Ports, #(#other_generics,)* Provider> ServiceBuilder<P, #(#before),*, Provider> {
             #[must_use]
             pub fn #field(
                 self,
                 #field: <P as Ports>::#assoc,
-            ) -> ServiceBuilder<P, #(#after),*> {
+            ) -> ServiceBuilder<P, #(#after),*, Provider> {
                 ServiceBuilder {
                     #field,
                     #(#other_moves,)*
+                    provider: self.provider,
                     _ports: ::core::marker::PhantomData,
                 }
             }
@@ -1027,6 +1375,8 @@ mod tests {
         assert_eq!(input.ports[0].query_view, query_database);
         assert_eq!(input.ports[1].command_view, command_clock);
         assert!(input.context.is_none());
+        assert!(!input.workflow);
+        assert!(input.workflows.is_empty());
     }
 
     #[test]
@@ -1040,5 +1390,127 @@ mod tests {
         };
         let expected: Type = parse_quote!(crate::Context);
         assert_eq!(input.context, Some(expected));
+        assert!(!input.workflow);
+        assert!(input.workflows.is_empty());
+    }
+
+    #[test]
+    fn workflow_requires_context() {
+        let parsed = syn::parse2::<RuntimeInput>(quote! {
+            error = crate::Error,
+            workflow,
+            ports {
+                database: DB: crate::port::Database,
+            }
+        });
+        let Err(err) = parsed else {
+            panic!("workflow without context should fail to parse");
+        };
+        assert!(err.to_string().contains("workflow requires context"));
+    }
+
+    #[test]
+    fn workflows_requires_the_workflow_keyword() {
+        let parsed = syn::parse2::<RuntimeInput>(quote! {
+            error = crate::Error,
+            context = crate::Context,
+            ports {
+                database: DB: crate::port::Database,
+            },
+            workflows {
+                crate::cqrs::Copy,
+            }
+        });
+        let Err(err) = parsed else {
+            panic!("workflows without workflow should fail to parse");
+        };
+        assert!(err.to_string().contains("workflows requires workflow"));
+    }
+
+    #[test]
+    fn omitted_workflows_block_is_empty() {
+        let input: RuntimeInput = parse_quote! {
+            error = crate::Error,
+            context = crate::Context,
+            workflow,
+            ports {
+                database: DB: crate::port::Database,
+            }
+        };
+        assert!(input.workflow);
+        assert!(input.workflows.is_empty());
+    }
+
+    #[test]
+    fn workflows_block_stores_each_path() {
+        let input: RuntimeInput = parse_quote! {
+            error = crate::Error,
+            context = crate::Context,
+            workflow,
+            ports {
+                database: DB: crate::port::Database,
+            },
+            workflows {
+                crate::cqrs::Copy,
+                crate::cqrs::Export,
+            }
+        };
+        let expected: Vec<Path> = vec![
+            parse_quote!(crate::cqrs::Copy),
+            parse_quote!(crate::cqrs::Export),
+        ];
+        assert_eq!(input.workflows, expected);
+    }
+
+    #[test]
+    fn without_workflow_the_expansion_does_not_mention_durare() {
+        let input: RuntimeInput = parse_quote! {
+            error = crate::Error,
+            context = crate::Context,
+            ports {
+                database: DB: crate::port::Database,
+            }
+        };
+        let tokens = expand(input).to_string();
+        assert!(!tokens.contains("durare"));
+        assert!(!tokens.contains("start_workflow"));
+        assert!(!tokens.contains("run_workflow"));
+        assert!(!tokens.contains("workflow_provider"));
+    }
+
+    #[test]
+    fn launch_registers_each_listed_workflow() {
+        let input: RuntimeInput = parse_quote! {
+            error = crate::Error,
+            context = crate::Context,
+            workflow,
+            ports {
+                database: DB: crate::port::Database,
+            },
+            workflows {
+                crate::cqrs::Copy,
+                crate::cqrs::Export,
+            }
+        };
+        let tokens = expand(input).to_string();
+        assert!(tokens.contains("< crate :: cqrs :: Copy as Workflow > :: name ()"));
+        assert!(tokens.contains("< crate :: cqrs :: Export as Workflow > :: name ()"));
+        assert!(tokens.contains("fn run_workflow"));
+        assert!(tokens.contains("fn attempt"));
+        assert!(tokens.contains("struct Attempt"));
+        assert!(tokens.contains("fn attempt_defaults"));
+        assert!(tokens.contains("struct AttemptDefaults"));
+        assert!(tokens.contains("from_millis (100)"));
+        assert!(tokens.contains("from_secs (5)"));
+        assert!(tokens.contains("fn max_retries"));
+        assert!(tokens.contains("fn retry_if"));
+        assert_eq!(tokens.matches("as Workflow > :: name").count(), 3);
+        let query_env = tokens.split("pub trait QueryEnv").nth(1).unwrap();
+        let query_def = query_env.split("pub trait CommandEnv").next().unwrap();
+        let command_env = query_env.split("pub trait CommandEnv").nth(1).unwrap();
+        assert!(!query_def.contains("start_workflow"));
+        assert!(
+            command_env.starts_with(" : EnvExt + QueryRuntime + CommandRuntime + WorkflowRuntime")
+        );
     }
 }

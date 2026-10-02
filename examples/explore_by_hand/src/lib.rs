@@ -1,12 +1,14 @@
+pub mod durable;
+
 pub use service::{Ports, Service};
 
 mod service {
     pub struct Service<P: Ports> {
-        env: ::std::sync::Arc<Env<P>>,
+        shared: ::std::sync::Arc<Shared<P>>,
     }
 
     pub struct ContextRuntime<'a, P: Ports> {
-        env: &'a Env<P>,
+        shared: &'a Shared<P>,
         ctx: &'a crate::Context,
     }
 
@@ -34,11 +36,34 @@ mod service {
             C: Command;
     }
 
+    /// Start a workflow already registered on this service.
+    ///
+    /// Queries do not have this method. The service command env is the
+    /// implementation that reaches the launched engine. Other command envs,
+    /// including the one inside a running workflow, return an error. A test
+    /// replaces that call through `MockEnv::expect_start_workflow`.
+    #[cfg_attr(test, ::mockall::automock)]
+    pub trait WorkflowRuntime {
+        fn start_workflow<W: crate::durable::Workflow>(
+            &self,
+            id: &str,
+            input: W,
+        ) -> impl Future<Output = Result<crate::durable::WorkflowRun<W::Output>, crate::Error>> + Send
+        {
+            let _ = (id, input);
+            async {
+                Err(crate::Error::General(
+                    "workflows are started by a launched service".into(),
+                ))
+            }
+        }
+    }
+
     pub trait QueryEnv: EnvExt + QueryRuntime {
         fn database(&self) -> crate::view::DatabaseQuery<'_, <Self::Ports as Ports>::DB>;
     }
 
-    pub trait CommandEnv: EnvExt + CommandRuntime + QueryRuntime {
+    pub trait CommandEnv: EnvExt + CommandRuntime + QueryRuntime + WorkflowRuntime {
         fn database(&self) -> crate::view::DatabaseCommand<'_, <Self::Ports as Ports>::DB>;
     }
 
@@ -67,7 +92,10 @@ mod service {
     impl<P: Ports> Service<P> {
         pub fn new(database: P::DB) -> Self {
             Self {
-                env: ::std::sync::Arc::new(Env { database }),
+                shared: ::std::sync::Arc::new(Shared {
+                    env: ::std::sync::Arc::new(Env { database }),
+                    engine: ::std::sync::OnceLock::new(),
+                }),
             }
         }
 
@@ -84,9 +112,23 @@ mod service {
         #[must_use]
         pub fn with_context<'a>(&'a self, ctx: &'a crate::Context) -> ContextRuntime<'a, P> {
             ContextRuntime {
-                env: self.env.as_ref(),
+                shared: self.shared.as_ref(),
                 ctx,
             }
+        }
+
+        /// Register the long-lived workflows this service can start.
+        ///
+        /// A command reaches them through [`WorkflowRuntime::start_workflow`].
+        pub fn workflows(&self) -> crate::durable::WorkflowBuilder<'_, P> {
+            crate::durable::WorkflowBuilder::new(
+                ::std::sync::Arc::clone(&self.shared.env),
+                &self.shared.engine,
+            )
+        }
+
+        pub async fn shutdown(&self) -> Result<(), crate::Error> {
+            crate::durable::shutdown(self.shared.engine.get()).await
         }
     }
 
@@ -102,16 +144,77 @@ mod service {
     impl<P: Ports> Clone for Service<P> {
         fn clone(&self) -> Self {
             Self {
-                env: self.env.clone(),
+                shared: self.shared.clone(),
             }
         }
     }
 
     // Context Runtime Wiring
 
-    struct Env<P: Ports> {
+    pub(crate) struct Shared<P: Ports> {
+        env: ::std::sync::Arc<Env<P>>,
+        engine: ::std::sync::OnceLock<durare::DurableEngine>,
+    }
+
+    pub(crate) struct Env<P: Ports> {
         database: P::DB,
     }
+
+    /// Owned command env for a workflow run.
+    ///
+    /// The command's borrow ends when the command returns. This value keeps
+    /// the same ports and the caller that command recorded.
+    pub struct WorkflowCommandEnv<P: Ports> {
+        env: ::std::sync::Arc<Env<P>>,
+        caller: crate::Context,
+    }
+
+    impl<P: Ports> WorkflowCommandEnv<P> {
+        pub(crate) fn new(env: ::std::sync::Arc<Env<P>>, caller: crate::Context) -> Self {
+            Self { env, caller }
+        }
+    }
+
+    impl<P: Ports> EnvExt for WorkflowCommandEnv<P> {
+        type Ports = P;
+
+        fn ctx(&self) -> &crate::Context {
+            &self.caller
+        }
+    }
+
+    impl<P: Ports> QueryRuntime for WorkflowCommandEnv<P> {
+        async fn query<Q>(&self, query: Q) -> Result<Q::Value, Q::Error>
+        where
+            Q: Query,
+        {
+            query.run(self).await
+        }
+    }
+
+    impl<P: Ports> CommandRuntime for WorkflowCommandEnv<P> {
+        async fn command<C>(&self, cmd: C) -> Result<C::Value, C::Error>
+        where
+            C: Command,
+        {
+            cmd.run(self).await
+        }
+    }
+
+    impl<P: Ports> QueryEnv for WorkflowCommandEnv<P> {
+        fn database(&self) -> crate::view::DatabaseQuery<'_, <Self::Ports as Ports>::DB> {
+            crate::view::DatabaseQuery::new(&self.env.database)
+        }
+    }
+
+    impl<P: Ports> CommandEnv for WorkflowCommandEnv<P> {
+        fn database(&self) -> crate::view::DatabaseCommand<'_, <Self::Ports as Ports>::DB> {
+            crate::view::DatabaseCommand::new(&self.env.database)
+        }
+    }
+
+    // The default start_workflow refuses, so a run cannot start another one.
+    impl<P: Ports> WorkflowRuntime for WorkflowCommandEnv<P> {}
 
     impl<'a, P: Ports> ContextRuntime<'a, P> {
         pub async fn command<C: Command>(&self, cmd: C) -> Result<C::Value, C::Error> {
@@ -151,13 +254,28 @@ mod service {
 
     impl<'a, P: Ports> QueryEnv for ContextRuntime<'a, P> {
         fn database(&self) -> crate::view::DatabaseQuery<'_, <Self::Ports as Ports>::DB> {
-            crate::view::DatabaseQuery::new(&self.env.database)
+            crate::view::DatabaseQuery::new(&self.shared.env.database)
         }
     }
 
     impl<'a, P: Ports> CommandEnv for ContextRuntime<'a, P> {
         fn database(&self) -> crate::view::DatabaseCommand<'_, <Self::Ports as Ports>::DB> {
-            crate::view::DatabaseCommand::new(&self.env.database)
+            crate::view::DatabaseCommand::new(&self.shared.env.database)
+        }
+    }
+
+    impl<'a, P: Ports> WorkflowRuntime for ContextRuntime<'a, P> {
+        async fn start_workflow<W: crate::durable::Workflow>(
+            &self,
+            id: &str,
+            input: W,
+        ) -> Result<crate::durable::WorkflowRun<W::Output>, crate::Error> {
+            let engine = self
+                .shared
+                .engine
+                .get()
+                .ok_or_else(|| crate::Error::General("workflows are not launched".into()))?;
+            crate::durable::start(engine, id, *self.ctx, input).await
         }
     }
 }
@@ -180,7 +298,10 @@ mod view {
             Self(val)
         }
 
-        pub fn get(&self, id: u32) -> impl Future<Output = Result<u32, crate::Error>> + Send {
+        pub fn get(
+            &self,
+            id: u32,
+        ) -> impl Future<Output = Result<u32, crate::Error>> + Send + use<'a, T> {
             <T as Database>::get(self.0, id)
         }
     }
@@ -192,7 +313,10 @@ mod view {
             Self(val)
         }
 
-        pub fn get(&self, id: u32) -> impl Future<Output = Result<u32, crate::Error>> + Send {
+        pub fn get(
+            &self,
+            id: u32,
+        ) -> impl Future<Output = Result<u32, crate::Error>> + Send + use<'a, T> {
             <T as Database>::get(self.0, id)
         }
 
@@ -200,7 +324,7 @@ mod view {
             &self,
             id: u32,
             val: u32,
-        ) -> impl Future<Output = Result<(), crate::Error>> + Send {
+        ) -> impl Future<Output = Result<(), crate::Error>> + Send + use<'a, T> {
             <T as Database>::put(self.0, id, val)
         }
     }
@@ -216,6 +340,10 @@ pub mod support {
         crate::service::__mock_MockCommandRuntime_CommandRuntime::__command::Expectation<C>;
     type QueryExpectation<Q> =
         crate::service::__mock_MockQueryRuntime_QueryRuntime::__query::Expectation<Q>;
+    type StartExpectation<W> =
+        crate::service::__mock_MockWorkflowRuntime_WorkflowRuntime::__start_workflow::Expectation<
+            W,
+        >;
 
     #[derive(Default)]
     pub struct MockEnv {
@@ -223,6 +351,7 @@ pub mod support {
         pub ctx: crate::Context,
         query_runtime: MockQueryRuntime,
         command_runtime: MockCommandRuntime,
+        workflow_runtime: MockWorkflowRuntime,
     }
 
     // Wiring up MockEnv
@@ -234,6 +363,12 @@ pub mod support {
 
         pub fn expect_command<C: Command>(&mut self) -> &mut CommandExpectation<C> {
             self.command_runtime.expect_command::<C>()
+        }
+
+        pub fn expect_start_workflow<W: crate::durable::Workflow>(
+            &mut self,
+        ) -> &mut StartExpectation<W> {
+            self.workflow_runtime.expect_start_workflow::<W>()
         }
     }
 
@@ -267,6 +402,16 @@ pub mod support {
         }
     }
 
+    impl WorkflowRuntime for MockEnv {
+        async fn start_workflow<W: crate::durable::Workflow>(
+            &self,
+            id: &str,
+            input: W,
+        ) -> Result<crate::durable::WorkflowRun<W::Output>, crate::Error> {
+            self.workflow_runtime.start_workflow(id, input).await
+        }
+    }
+
     impl QueryEnv for MockEnv {
         fn database(&self) -> crate::view::DatabaseQuery<'_, <Self::Ports as Ports>::DB> {
             crate::view::DatabaseQuery::new(&self.database)
@@ -286,7 +431,7 @@ pub enum Error {
     General(String),
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Context {
     #[default]
     Nobody,
