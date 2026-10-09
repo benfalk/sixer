@@ -235,7 +235,7 @@ mod tests {
             self.reads.fetch_add(1, Ordering::SeqCst);
             let failing = self
                 .fail_gets
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
             if failing.is_ok() {
                 return Err(Error::General("upstream down".into()));
             }
@@ -322,7 +322,7 @@ mod tests {
         let remaining = Arc::new(AtomicUsize::new(2));
         env.database.expect_get().times(3).returning(move |_| {
             let fail = remaining
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok();
             Box::pin(std::future::ready(if fail {
                 Err(Error::General("upstream down".into()))

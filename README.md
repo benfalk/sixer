@@ -167,7 +167,7 @@ Durare 0.4 needs a `postgres` or `sqlite` feature. `postgres` skips the
 SQLite C build, and `InMemoryProvider` is still a valid state backend.
 
 ```toml
-durare = { version = "0.4", default-features = false, features = ["postgres"] }
+durare = { version = "0.5", default-features = false, features = ["postgres"] }
 serde = { version = "1", features = ["derive"] }
 ```
 

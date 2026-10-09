@@ -294,9 +294,9 @@ checksum = "1435fa1053d8b2fbbe9be7e97eca7f33d37b28409959813daefc1446a14247f1"
 
 [[package]]
 name = "durare"
-version = "0.4.1"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "029f6249e2a7e698d43b99326db5346f6071a5a18b91ff516b67f80b3dc05b60"
+checksum = "1e0bf8a55b6128f3b639c8430fc6b41fd7fa62641ab638ab3cdf9680a2796a77"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -320,9 +320,9 @@ dependencies = [
 
 [[package]]
 name = "durare-macros"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5f464551d4ab489f3e0cac451bdc0dd87400141e9b0e41b91ec3970a2ee22e8"
+checksum = "028f0440357eb64b25f01d7d05ae5e605d12f0f30c54b709387984490c8237c9"
 dependencies = [
  "heck",
  "proc-macro2",
