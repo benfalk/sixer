@@ -44,9 +44,10 @@ impl Context {
 }
 ```
 
-1. Here we have a crate level `Error`; `sixer` requires all queries and commands
-   errors can be converted into this structure. This enforcement is more than
-   just good hygiene; future drivers will rely on this.
+1. Here we have a crate level `Error`. A query, a command, and a workflow
+   each return their own error, and that error converts into this one.
+   `launch` uses the conversion when a workflow run fails. Callers of a
+   query or command still see that use case's own error.
 
 2. A context is not required for `sixer`; however, in this tutorial we're going
    to be using one.  Your context **MUST** implement default.  The default is
@@ -222,9 +223,16 @@ impl Copy {
         env: &impl CommandEnv,
     ) -> Result<(), Error> {
         let key = self.key;
-        let value = ctx
+        let value = match ctx
             .step("read", env.database().get(key))
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(CallError::Failed(err)) => return Err(err),
+            Err(CallError::Recorded(message)) => {
+                return Err(Error::General(message));
+            }
+        };
         Put { key: self.dest, val: value }.run(env).await
     }
 }
@@ -237,13 +245,23 @@ between compilers, so a persisted run sets a fixed name. `ctx.step`
 journals the first outcome of a port call. A call left outside
 `step` runs live, so a privilege check still applies.
 
+The workflow `Result` error is that workflow's own type, the same
+rule as a command or a query. It converts into the service `Error`.
+`ctx.step` and `Attempt::run` return a `CallError`. `Failed` holds
+the port error when the call ran, so the workflow error can hold
+it. `Recorded` is the journal message when the call does not run.
+The workflow maps that message into its own error. The journal
+keeps the call error's message. `WorkflowRun::result` returns the
+service `Error`.
+
 `ctx.attempt` retries before that write. It takes the step name and
 returns a builder. `max_retries` counts attempts after the first
 failure. `run` takes a closure the builder can call again. Only the
 final success or the final error is saved. With no `retry_if`
-predicate, every error is retried. A predicate sees the crate error
-built from the failure's message. The builder also takes
-`backoff_factor`, `base_interval`, and `max_interval`.
+predicate, every error is retried. The call's error converts into the
+service error before the predicate runs. The predicate sees that
+service error built from the failure's message. The builder also
+takes `backoff_factor`, `base_interval`, and `max_interval`.
 
 ```rust
 let value = ctx
@@ -277,9 +295,17 @@ impl Copy {
         env: &impl CommandEnv,
     ) -> Result<u32, Error> {
         let key = self.key;
-        ctx.attempt("read")
+        match ctx
+            .attempt("read")
             .run(|| env.database().get(key))
             .await
+        {
+            Ok(value) => Ok(value),
+            Err(CallError::Failed(err)) => Err(err),
+            Err(CallError::Recorded(message)) => {
+                Err(Error::General(message))
+            }
+        }
     }
 }
 ```

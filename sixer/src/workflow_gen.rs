@@ -69,6 +69,11 @@ pub fn items(
             type Output:
                 ::serde::Serialize + ::serde::de::DeserializeOwned + ::core::marker::Send + 'static;
 
+            /// Error returned by [`Workflow::run`].
+            ///
+            /// A workflow chooses this type, as a command or a query does. It
+            /// converts into the service error. The engine stores that service
+            /// error when the run fails.
             type Error: ::core::convert::Into<#error>;
 
             fn run(
@@ -99,6 +104,29 @@ pub fn items(
             Direct,
         }
 
+        /// Failure of one journaled port call.
+        ///
+        /// [`Failed`](Self::Failed) is the error the call returned, so a
+        /// workflow error can hold that port error. [`Recorded`](Self::Recorded)
+        /// is the message the journal stored. The workflow maps that message
+        /// into its own error. A replay does not run the call.
+        #[derive(Debug)]
+        pub enum CallError<E> {
+            /// The call ran and returned this error.
+            Failed(E),
+            /// The journal message. The call did not run.
+            Recorded(::std::string::String),
+        }
+
+        impl<E: ::core::fmt::Display> ::core::fmt::Display for CallError<E> {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
+                match self {
+                    Self::Failed(err) => ::core::fmt::Display::fmt(err, f),
+                    Self::Recorded(message) => ::core::fmt::Display::fmt(message, f),
+                }
+            }
+        }
+
         impl WorkflowContext {
             fn new(durable: ::durare::DurableContext, defaults: AttemptDefaults) -> Self {
                 Self {
@@ -117,32 +145,46 @@ pub fn items(
 
             /// Record the result of one port call under `name`.
             ///
-            /// The future runs once. Its success or its error is what a later
-            /// replay returns.
-            pub fn step<'a, T, Fut>(
+            /// The future runs once. [`CallError::Failed`] is that future's
+            /// error, so a workflow error can hold the port error. The journal
+            /// stores the error's message. A replay does not run the future
+            /// again. [`CallError::Recorded`] is that message, and the workflow
+            /// maps it into the workflow error.
+            pub fn step<'a, T, E, Fut>(
                 &'a self,
                 name: &'a str,
                 call: Fut,
-            ) -> impl ::core::future::Future<Output = ::core::result::Result<T, #error>>
+            ) -> impl ::core::future::Future<Output = ::core::result::Result<T, CallError<E>>>
                 + ::core::marker::Send
                 + 'a
             where
                 T: ::serde::Serialize + ::serde::de::DeserializeOwned + ::core::marker::Send,
-                Fut: ::core::future::Future<Output = ::core::result::Result<T, #error>>
+                E: ::core::fmt::Display + ::core::marker::Send,
+                Fut: ::core::future::Future<Output = ::core::result::Result<T, E>>
                     + ::core::marker::Send
                     + 'a,
             {
                 let mode = self.mode.clone();
                 async move {
                     match mode {
-                        CallMode::Durable(durable) => durable
-                            .step(name, || async move {
-                                call.await.map_err(into_engine)
-                            })
-                            .await
-                            .map_err(from_engine),
+                        CallMode::Durable(durable) => {
+                            let saved = ::std::sync::Arc::new(::std::sync::Mutex::new(None));
+                            let slot = ::std::sync::Arc::clone(&saved);
+                            let outcome = durable
+                                .step(name, || {
+                                    let slot = ::std::sync::Arc::clone(&slot);
+                                    async move {
+                                        call.await.map_err(|err| park_call_error(&slot, err))
+                                    }
+                                })
+                                .await;
+                            match outcome {
+                                Ok(value) => Ok(value),
+                                Err(err) => Err(take_call_error(&saved, err)),
+                            }
+                        }
                         #[cfg(test)]
-                        CallMode::Direct => call.await,
+                        CallMode::Direct => call.await.map_err(CallError::Failed),
                     }
                 }
             }
@@ -164,7 +206,8 @@ pub fn items(
         ///
         /// `step` and `attempt` call the ports on `env`. An attempt uses the
         /// workflow's retry policy and does not wait between tries. Nothing is
-        /// journaled, so another call runs the body again.
+        /// journaled, so another call runs the body again. The `Result` error
+        /// is the workflow's own error.
         #[cfg(test)]
         pub async fn run_workflow<W: Workflow>(
             env: &impl CommandEnv,
@@ -273,8 +316,9 @@ pub fn items(
 
             /// Decide whether a failure is tried again.
             ///
-            /// The predicate sees the crate error built from the failure's
-            /// message. Returning `false` stops at once.
+            /// The call's error converts into the service error before the
+            /// predicate runs. The predicate sees that service error built
+            /// from the failure's message. Returning `false` stops at once.
             pub fn retry_if<P>(mut self, predicate: P) -> Self
             where
                 P: Fn(&#error) -> bool + ::core::marker::Send + ::core::marker::Sync + 'static,
@@ -286,30 +330,47 @@ pub fn items(
             }
 
             /// Run `call` once per attempt and return the journaled outcome.
+            ///
+            /// [`CallError::Failed`] is the call's error, so a workflow error
+            /// can hold the port error. The journal stores that error's
+            /// message. A replay does not run the call.
+            /// [`CallError::Recorded`] is that message, and the workflow maps
+            /// it into the workflow error.
             #[must_use]
-            pub fn run<'a, T, F, Fut>(
+            pub fn run<'a, T, E, F, Fut>(
                 self,
                 mut call: F,
-            ) -> impl ::core::future::Future<Output = ::core::result::Result<T, #error>>
+            ) -> impl ::core::future::Future<Output = ::core::result::Result<T, CallError<E>>>
                 + ::core::marker::Send
                 + 'a
             where
                 T: ::serde::Serialize + ::serde::de::DeserializeOwned + ::core::marker::Send,
+                E: ::core::fmt::Display + ::core::marker::Send,
                 F: ::core::ops::FnMut() -> Fut + ::core::marker::Send + 'a,
-                Fut: ::core::future::Future<Output = ::core::result::Result<T, #error>>
+                Fut: ::core::future::Future<Output = ::core::result::Result<T, E>>
                     + ::core::marker::Send
                     + 'a,
             {
                 let Attempt { mode, opts } = self;
                 async move {
                     match mode {
-                        CallMode::Durable(durable) => durable
-                            .step_with(opts, || {
-                                let attempt = call();
-                                async move { attempt.await.map_err(into_engine) }
-                            })
-                            .await
-                            .map_err(from_engine),
+                        CallMode::Durable(durable) => {
+                            let saved = ::std::sync::Arc::new(::std::sync::Mutex::new(None));
+                            let slot = ::std::sync::Arc::clone(&saved);
+                            let outcome = durable
+                                .step_with(opts, || {
+                                    let slot = ::std::sync::Arc::clone(&slot);
+                                    let attempt = call();
+                                    async move {
+                                        attempt.await.map_err(|err| park_call_error(&slot, err))
+                                    }
+                                })
+                                .await;
+                            match outcome {
+                                Ok(value) => Ok(value),
+                                Err(err) => Err(take_call_error(&saved, err)),
+                            }
+                        }
                         #[cfg(test)]
                         CallMode::Direct => {
                             let mut tries = 0u32;
@@ -321,7 +382,7 @@ pub fn items(
                                             pred(&::durare::Error::app(err.to_string()))
                                         });
                                         if !retryable || tries >= opts.max_retries {
-                                            return Err(err);
+                                            return Err(CallError::Failed(err));
                                         }
                                         tries += 1;
                                     }
@@ -368,6 +429,9 @@ pub fn items(
         }
 
         impl<O: ::serde::de::DeserializeOwned + 'static> WorkflowRun<O> {
+            /// Wait for the recorded output.
+            ///
+            /// A failure is the service error rebuilt from the stored message.
             pub async fn result(self) -> ::core::result::Result<O, #error> {
                 match self.inner {
                     RunInner::Live(handle) => handle.await.map_err(from_engine),
@@ -438,6 +502,29 @@ pub fn items(
         }
 
         impl<P: Ports> WorkflowRuntime for WorkflowCommandEnv<P> {}
+
+        fn park_call_error<E: ::core::fmt::Display>(
+            slot: &::std::sync::Mutex<Option<E>>,
+            err: E,
+        ) -> ::durare::Error {
+            let engine = ::durare::Error::app(err.to_string());
+            *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(err);
+            engine
+        }
+
+        fn take_call_error<E>(
+            slot: &::std::sync::Mutex<::core::option::Option<E>>,
+            engine_err: ::durare::Error,
+        ) -> CallError<E> {
+            match slot
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take()
+            {
+                Some(err) => CallError::Failed(err),
+                None => CallError::Recorded(engine_err.to_string()),
+            }
+        }
 
         fn into_engine(err: #error) -> ::durare::Error {
             ::durare::Error::app(err.to_string())

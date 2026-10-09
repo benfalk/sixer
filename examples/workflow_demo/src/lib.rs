@@ -23,6 +23,18 @@ impl From<durare::Error> for Error {
     }
 }
 
+impl From<port::GetError> for Error {
+    fn from(err: port::GetError) -> Self {
+        Self::General(err.to_string())
+    }
+}
+
+impl From<port::PutError> for Error {
+    fn from(err: port::PutError) -> Self {
+        Self::General(err.to_string())
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Context {
     #[default]
@@ -43,11 +55,51 @@ pub mod port {
     #[cfg_attr(test, ::mockall::automock)]
     pub trait Database: Send + Sync {
         #[query]
-        async fn get(&self, id: u32) -> Result<u32, crate::Error>;
+        async fn get(&self, id: u32) -> Result<u32, GetError>;
 
         #[command]
-        async fn put(&self, id: u32, val: u32) -> Result<(), crate::Error>;
+        async fn put(&self, id: u32, val: u32) -> Result<(), PutError>;
     }
+
+    #[derive(Debug, ::thiserror::Error)]
+    #[error("getting from database: {0}")]
+    pub struct GetError(Box<dyn ::std::error::Error + Send + Sync>);
+
+    impl GetError {
+        /// Wrap a failure from the database.
+        #[must_use]
+        pub fn new(error: impl ::std::error::Error + Send + Sync + 'static) -> Self {
+            Self(Box::new(error))
+        }
+
+        /// Wrap a failure that is only a message.
+        #[must_use]
+        pub fn message(message: impl Into<::std::string::String>) -> Self {
+            Self::new(Message(message.into()))
+        }
+    }
+
+    #[derive(Debug, ::thiserror::Error)]
+    #[error("putting into database: {0}")]
+    pub struct PutError(Box<dyn ::std::error::Error + Send + Sync>);
+
+    impl PutError {
+        /// Wrap a failure from the database.
+        #[must_use]
+        pub fn new(error: impl ::std::error::Error + Send + Sync + 'static) -> Self {
+            Self(Box::new(error))
+        }
+
+        /// Wrap a failure that is only a message.
+        #[must_use]
+        pub fn message(message: impl Into<::std::string::String>) -> Self {
+            Self::new(Message(message.into()))
+        }
+    }
+
+    #[derive(Debug, ::thiserror::Error)]
+    #[error("{0}")]
+    struct Message(String);
 }
 
 ::sixer::runtime! {
@@ -69,7 +121,104 @@ pub use service::QueryEnv;
 
 pub mod cqrs {
     use crate::Error;
-    use crate::service::{Command, CommandEnv, Workflow, WorkflowContext, WorkflowRun};
+    use crate::port::GetError;
+    use crate::port::PutError as PortPut;
+    use crate::service::{CallError, Command, CommandEnv, Workflow, WorkflowContext, WorkflowRun};
+
+    /// Failure of [`Put`]. A store failure holds the port error.
+    #[derive(Debug, ::thiserror::Error)]
+    pub enum PutError {
+        #[error("lacks privilege")]
+        Privilege,
+        #[error(transparent)]
+        Store(#[from] PortPut),
+    }
+
+    impl From<PutError> for Error {
+        fn from(err: PutError) -> Self {
+            match err {
+                PutError::Privilege => Self::General("lacks privilege".into()),
+                PutError::Store(err) => err.into(),
+            }
+        }
+    }
+
+    /// Failure of the [`Copy`] workflow.
+    ///
+    /// A read or a write holds the port error when that call ran. `Recorded`
+    /// is the journal message when a replay did not run the read. The
+    /// privilege check is this workflow's own failure. The type converts
+    /// into [`Error`].
+    #[derive(Debug, ::thiserror::Error)]
+    pub enum CopyError {
+        #[error("lacks privilege")]
+        Privilege,
+        #[error(transparent)]
+        Read(#[from] GetError),
+        #[error(transparent)]
+        Write(#[from] PortPut),
+        #[error("{0}")]
+        Recorded(String),
+    }
+
+    impl From<CallError<GetError>> for CopyError {
+        fn from(err: CallError<GetError>) -> Self {
+            match err {
+                CallError::Failed(err) => Self::Read(err),
+                CallError::Recorded(message) => Self::Recorded(message),
+            }
+        }
+    }
+
+    impl From<PutError> for CopyError {
+        fn from(err: PutError) -> Self {
+            match err {
+                PutError::Privilege => Self::Privilege,
+                PutError::Store(err) => Self::Write(err),
+            }
+        }
+    }
+
+    impl From<CopyError> for Error {
+        fn from(err: CopyError) -> Self {
+            match err {
+                CopyError::Privilege => Self::General("lacks privilege".into()),
+                CopyError::Read(err) => err.into(),
+                CopyError::Write(err) => err.into(),
+                CopyError::Recorded(message) => Self::General(message),
+            }
+        }
+    }
+
+    /// Failure of a read workflow.
+    ///
+    /// `Read` holds the port error when the read ran. `Recorded` is the
+    /// journal message when a replay did not run the read.
+    #[derive(Debug, ::thiserror::Error)]
+    pub enum ReadError {
+        #[error(transparent)]
+        Read(#[from] GetError),
+        #[error("{0}")]
+        Recorded(String),
+    }
+
+    impl From<CallError<GetError>> for ReadError {
+        fn from(err: CallError<GetError>) -> Self {
+            match err {
+                CallError::Failed(err) => Self::Read(err),
+                CallError::Recorded(message) => Self::Recorded(message),
+            }
+        }
+    }
+
+    impl From<ReadError> for Error {
+        fn from(err: ReadError) -> Self {
+            match err {
+                ReadError::Read(err) => err.into(),
+                ReadError::Recorded(message) => Self::General(message),
+            }
+        }
+    }
 
     #[derive(Debug)]
     pub struct Put {
@@ -79,12 +228,13 @@ pub mod cqrs {
 
     #[::sixer::command]
     impl Put {
-        async fn run(self, env: &impl CommandEnv) -> Result<(), Error> {
+        async fn run(self, env: &impl CommandEnv) -> Result<(), PutError> {
             if env.ctx().is_nobody() {
-                return Err(Error::General("lacks privilege".into()));
+                return Err(PutError::Privilege);
             }
 
-            env.database().put(self.key, self.val).await
+            env.database().put(self.key, self.val).await?;
+            Ok(())
         }
     }
 
@@ -104,7 +254,7 @@ pub mod cqrs {
 
     #[::sixer::workflow("copy")]
     impl Copy {
-        async fn run(self, ctx: &WorkflowContext, env: &impl CommandEnv) -> Result<(), Error> {
+        async fn run(self, ctx: &WorkflowContext, env: &impl CommandEnv) -> Result<(), CopyError> {
             let key = self.key;
             let dest = self.dest;
             let value = ctx.step("read", env.database().get(key)).await?;
@@ -113,7 +263,8 @@ pub mod cqrs {
                 val: value,
             }
             .run(env)
-            .await
+            .await?;
+            Ok(())
         }
     }
 
@@ -134,9 +285,9 @@ pub mod cqrs {
     #[::sixer::workflow("flaky_read")]
     #[::sixer::attempt_defaults(max_retries = 3, base_interval = 1ms)]
     impl FlakyRead {
-        async fn run(self, ctx: &WorkflowContext, env: &impl CommandEnv) -> Result<u32, Error> {
+        async fn run(self, ctx: &WorkflowContext, env: &impl CommandEnv) -> Result<u32, ReadError> {
             let key = self.key;
-            ctx.attempt("read").run(|| env.database().get(key)).await
+            Ok(ctx.attempt("read").run(|| env.database().get(key)).await?)
         }
     }
 
@@ -157,12 +308,13 @@ pub mod cqrs {
     #[::sixer::workflow("guarded_read")]
     #[::sixer::attempt_defaults(max_retries = 3, base_interval = 1ms)]
     impl GuardedRead {
-        async fn run(self, ctx: &WorkflowContext, env: &impl CommandEnv) -> Result<u32, Error> {
+        async fn run(self, ctx: &WorkflowContext, env: &impl CommandEnv) -> Result<u32, ReadError> {
             let key = self.key;
-            ctx.attempt("read")
+            Ok(ctx
+                .attempt("read")
                 .retry_if(|err| !err.to_string().contains("upstream down"))
                 .run(|| env.database().get(key))
-                .await
+                .await?)
         }
     }
 
@@ -182,9 +334,9 @@ pub mod cqrs {
 
     #[::sixer::workflow("once_read")]
     impl OnceRead {
-        async fn run(self, ctx: &WorkflowContext, env: &impl CommandEnv) -> Result<u32, Error> {
+        async fn run(self, ctx: &WorkflowContext, env: &impl CommandEnv) -> Result<u32, ReadError> {
             let key = self.key;
-            ctx.attempt("read").run(|| env.database().get(key)).await
+            Ok(ctx.attempt("read").run(|| env.database().get(key)).await?)
         }
     }
 }
@@ -199,8 +351,8 @@ mod tests {
     use durare::InMemoryProvider;
     use tokio::sync::RwLock;
 
-    use crate::cqrs::{Copy, FlakyRead, GuardedRead, OnceRead};
-    use crate::port::Database;
+    use crate::cqrs::{Copy, CopyError, FlakyRead, GuardedRead, OnceRead, ReadError};
+    use crate::port::{Database, GetError, PutError};
     use crate::service::{Command, MockEnv, Ports, run_workflow};
     use crate::{Context, Error, Service, WorkflowRun};
 
@@ -231,21 +383,21 @@ mod tests {
     }
 
     impl Database for CountingDb {
-        async fn get(&self, id: u32) -> Result<u32, Error> {
+        async fn get(&self, id: u32) -> Result<u32, GetError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             let failing = self
                 .fail_gets
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
             if failing.is_ok() {
-                return Err(Error::General("upstream down".into()));
+                return Err(GetError::message("upstream down"));
             }
             let rows = self.rows.read().await;
             rows.get(&id)
                 .copied()
-                .ok_or_else(|| Error::General("missing number".into()))
+                .ok_or_else(|| GetError::message("missing number"))
         }
 
-        async fn put(&self, id: u32, val: u32) -> Result<(), Error> {
+        async fn put(&self, id: u32, val: u32) -> Result<(), PutError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             self.rows.write().await.insert(id, val);
             Ok(())
@@ -298,7 +450,8 @@ mod tests {
             .withf(|id, val| *id == 8 && *val == 11)
             .returning(|_, _| Box::pin(std::future::ready(Ok(()))));
 
-        run_workflow(&env, Copy { key: 7, dest: 8 }).await
+        run_workflow(&env, Copy { key: 7, dest: 8 }).await?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -310,7 +463,7 @@ mod tests {
             .once()
             .returning(|_| Box::pin(std::future::ready(Ok(11))));
 
-        let err = run_workflow(&env, Copy { key: 7, dest: 8 })
+        let err: CopyError = run_workflow(&env, Copy { key: 7, dest: 8 })
             .await
             .expect_err("nobody");
         assert!(err.to_string().contains("lacks privilege"), "{err}");
@@ -325,7 +478,7 @@ mod tests {
                 .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                 .is_ok();
             Box::pin(std::future::ready(if fail {
-                Err(Error::General("upstream down".into()))
+                Err(GetError::message("upstream down"))
             } else {
                 Ok(11)
             }))
@@ -339,15 +492,15 @@ mod tests {
     #[tokio::test]
     async fn guarded_workflow_does_not_retry_a_known_failure() {
         let mut env = MockEnv::default();
-        env.database.expect_get().once().returning(|_| {
-            Box::pin(std::future::ready(Err(Error::General(
-                "upstream down".into(),
-            ))))
-        });
+        env.database
+            .expect_get()
+            .once()
+            .returning(|_| Box::pin(std::future::ready(Err(GetError::message("upstream down")))));
 
-        let err = run_workflow(&env, GuardedRead { key: 7 })
+        let err: ReadError = run_workflow(&env, GuardedRead { key: 7 })
             .await
             .expect_err("stopped");
+        assert!(err.to_string().contains("getting from database"), "{err}");
         assert!(err.to_string().contains("upstream down"), "{err}");
     }
 

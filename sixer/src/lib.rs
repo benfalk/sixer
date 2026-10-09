@@ -10,10 +10,11 @@
 //! view, which includes the query methods.
 //!
 //! [`query`], [`command`], and [`workflow`] sit on an inherent impl whose
-//! `async fn run` returns `Result<Output, Error>`. They emit the sealed trait
-//! impl. [`workflow`] is generated only when `runtime!` opts in. Pass a name,
-//! `#[workflow("copy")]`, to override `fn name`. [`attempt_defaults`] on that
-//! impl fills in `fn attempt_defaults`.
+//! `async fn run` returns `Result<Output, Error>`. That error is the use
+//! case's own type, and it converts into the service error. They emit the
+//! sealed trait impl. [`workflow`] is generated only when `runtime!` opts in.
+//! Pass a name, `#[workflow("copy")]`, to override `fn name`.
+//! [`attempt_defaults`] on that impl fills in `fn attempt_defaults`.
 //!
 //! `cargo test` of the calling crate needs `mockall` as a dev-dependency.
 //! Production builds do not.
@@ -317,9 +318,10 @@ pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// Lifts `async fn run` from an inherent impl onto `Workflow`.
 ///
 /// `run` takes `self`, `&WorkflowContext`, and `&impl CommandEnv`. `Output`
-/// and `Error` are the two type arguments of the function's `Result`. An
-/// optional name, `#[workflow("copy")]`, or `fn name() -> &'static str`,
-/// overrides the registration name. Optional
+/// and `Error` are the two type arguments of the function's `Result`. `Error`
+/// converts into the service error, the same bound as [`command`] and
+/// [`query`]. An optional name, `#[workflow("copy")]`, or
+/// `fn name() -> &'static str`, overrides the registration name. Optional
 /// `fn attempt_defaults() -> AttemptDefaults`, or [`attempt_defaults`], sets
 /// the policy for every `ctx.attempt`. Other methods in the impl stay
 /// inherent. `runtime!` must opt in with `workflow` or the `Workflow` trait
@@ -1504,6 +1506,8 @@ mod tests {
         assert!(tokens.contains("from_secs (5)"));
         assert!(tokens.contains("fn max_retries"));
         assert!(tokens.contains("fn retry_if"));
+        assert!(tokens.contains("enum CallError"));
+        assert!(tokens.contains("Recorded"));
         assert_eq!(tokens.matches("as Workflow > :: name").count(), 3);
         let query_env = tokens.split("pub trait QueryEnv").nth(1).unwrap();
         let query_def = query_env.split("pub trait CommandEnv").next().unwrap();
