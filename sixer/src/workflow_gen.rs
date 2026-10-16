@@ -110,6 +110,9 @@ pub fn items(
         /// workflow error can hold that port error. [`Recorded`](Self::Recorded)
         /// is the message the journal stored. The workflow maps that message
         /// into its own error. A replay does not run the call.
+        /// `CallError<E>` implements `std::error::Error` when `E` implements
+        /// `std::error::Error` and is `'static`. `Failed` returns that error
+        /// from `source`. `Recorded` has no source.
         #[derive(Debug)]
         pub enum CallError<E> {
             /// The call ran and returned this error.
@@ -123,6 +126,18 @@ pub fn items(
                 match self {
                     Self::Failed(err) => ::core::fmt::Display::fmt(err, f),
                     Self::Recorded(message) => ::core::fmt::Display::fmt(message, f),
+                }
+            }
+        }
+
+        impl<E> ::std::error::Error for CallError<E>
+        where
+            E: ::std::error::Error + 'static,
+        {
+            fn source(&self) -> ::core::option::Option<&(dyn ::std::error::Error + 'static)> {
+                match self {
+                    Self::Failed(err) => ::core::option::Option::Some(err),
+                    Self::Recorded(_) => ::core::option::Option::None,
                 }
             }
         }

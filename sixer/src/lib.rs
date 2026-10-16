@@ -1508,6 +1508,7 @@ mod tests {
         assert!(tokens.contains("fn retry_if"));
         assert!(tokens.contains("enum CallError"));
         assert!(tokens.contains("Recorded"));
+        assert!(tokens.contains("impl < E > :: std :: error :: Error for CallError < E >"));
         assert_eq!(tokens.matches("as Workflow > :: name").count(), 3);
         let query_env = tokens.split("pub trait QueryEnv").nth(1).unwrap();
         let query_def = query_env.split("pub trait CommandEnv").next().unwrap();

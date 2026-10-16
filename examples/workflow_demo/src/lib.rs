@@ -353,7 +353,7 @@ mod tests {
 
     use crate::cqrs::{Copy, CopyError, FlakyRead, GuardedRead, OnceRead, ReadError};
     use crate::port::{Database, GetError, PutError};
-    use crate::service::{Command, MockEnv, Ports, run_workflow};
+    use crate::service::{CallError, Command, MockEnv, Ports, run_workflow};
     use crate::{Context, Error, Service, WorkflowRun};
 
     #[derive(Clone, Default)]
@@ -408,6 +408,34 @@ mod tests {
 
     impl Ports for CountingPorts {
         type DB = CountingDb;
+    }
+
+    /// `thiserror`'s `#[from]` accepts `CallError` because it implements
+    /// `std::error::Error`.
+    #[derive(Debug, thiserror::Error)]
+    enum WrappedCall {
+        #[error("port call failed")]
+        Port(#[from] CallError<GetError>),
+    }
+
+    #[test]
+    fn call_error_implements_error() {
+        let failed = CallError::Failed(GetError::message("upstream down"));
+        let wrapped = WrappedCall::from(failed);
+        let call = std::error::Error::source(&wrapped)
+            .expect("the wrapper exposes the call error")
+            .downcast_ref::<CallError<GetError>>()
+            .expect("source is the call error");
+        let port = std::error::Error::source(call).expect("Failed exposes the port error");
+        assert_eq!(port.to_string(), "getting from database: upstream down");
+
+        let recorded = WrappedCall::from(CallError::<GetError>::Recorded("saved".to_string()));
+        let source = std::error::Error::source(&recorded)
+            .expect("the wrapper exposes the call error")
+            .downcast_ref::<CallError<GetError>>()
+            .expect("source is the call error");
+        assert!(std::error::Error::source(source).is_none());
+        assert_eq!(source.to_string(), "saved");
     }
 
     async fn launched(db: CountingDb) -> Result<Service<CountingPorts>, Error> {
