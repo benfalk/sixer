@@ -668,6 +668,10 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
     };
     let service_new = if input.workflow {
         quote! {
+            #[allow(
+                clippy::too_many_arguments,
+                reason = "each port is one parameter"
+            )]
             pub fn new(
                 #(#new_params,)*
                 provider: ::std::sync::Arc<dyn ::durare::StateProvider>,
@@ -683,6 +687,10 @@ fn expand(input: RuntimeInput) -> TokenStream2 {
         }
     } else {
         quote! {
+            #[allow(
+                clippy::too_many_arguments,
+                reason = "each port is one parameter"
+            )]
             pub fn new(#(#new_params),*) -> Self {
                 Self {
                     env: ::std::sync::Arc::new(Env { #(#env_init,)* }),
@@ -1478,6 +1486,7 @@ mod tests {
         assert!(!tokens.contains("start_workflow"));
         assert!(!tokens.contains("run_workflow"));
         assert!(!tokens.contains("workflow_provider"));
+        assert!(tokens.contains("clippy :: too_many_arguments"));
     }
 
     #[test]
@@ -1508,6 +1517,7 @@ mod tests {
         assert!(tokens.contains("fn retry_if"));
         assert!(tokens.contains("enum CallError"));
         assert!(tokens.contains("Recorded"));
+        assert!(tokens.contains("clippy :: too_many_arguments"));
         assert!(tokens.contains("impl < E > :: std :: error :: Error for CallError < E >"));
         assert_eq!(tokens.matches("as Workflow > :: name").count(), 3);
         let query_env = tokens.split("pub trait QueryEnv").nth(1).unwrap();
